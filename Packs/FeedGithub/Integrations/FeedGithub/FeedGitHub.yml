@@ -137,7 +137,7 @@ script:
       name: limit
     description: Gets indicators from the feed.
     name: github-get-indicators
-  dockerimage: demisto/python3:3.9.8.24399
+  dockerimage: demisto/jmespath:1.0.0.23980
   feed: true
   isfetch: false
   longRunning: false

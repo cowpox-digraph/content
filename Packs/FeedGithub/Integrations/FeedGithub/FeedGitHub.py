@@ -1,11 +1,6 @@
 import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401
 
-from enum import Enum
-
-DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-
-
 
 class Client(BaseClient):
     """Client class to interact with the service API
@@ -14,14 +9,14 @@ class Client(BaseClient):
     Should only do requests and return data.
     It inherits from BaseClient defined in CommonServer Python.
     Most calls use _http_request() that handles proxy, SSL verification, etc.
-    For this Hello_World Feed implementation, no special attributes defined
+    For this gitHub Feed implementation, no special attributes defined
     """
 
     def __init__(self, base_url: str, verify: bool, proxy: bool, owner: str, repo: str, headers: dict):
         base_url = urljoin(base_url, f"/repos/{owner}/{repo}/commits")
         super().__init__(base_url=base_url, verify=verify, proxy=proxy, headers=headers)
 
-    def get_list_commits(self,params= []) -> None:
+    def get_list_commits(self, params=[]) -> None:
         """
         Retrieves a list of commits from the GitHub repository.
 
@@ -62,7 +57,7 @@ class Client(BaseClient):
             Any exceptions raised by the `_http_request` method.
         """
         return {commit["sha"]: self._http_request("GET", commit["sha"]).get("files", []) for commit in list_commits[:2]}
-    
+
     def build_iterator(self) -> List:
         """Retrieves all entries from the feed.
         Returns:
@@ -101,7 +96,20 @@ class Client(BaseClient):
             raise ValueError(f"Could not parse returned data as indicator. \n\nError message: {err}")
         return result
 
+
 def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
+    """
+    Parsing files by their status.
+
+    Args:
+        commits_files (Dict[str, List[Dict[str, str]]]): A dictionary where keys are commit SHA strings and values
+            are lists of files changed in each commit.
+
+    Returns:
+        Dict[str, List[Dict[str, str]]]: A dictionary where keys are commit SHA strings and values
+            are lists of files that have A status 'added' or 'modified' in each commit.
+
+    """
     relevant_files: dict[str, list[dict]] = {}
     for commit, files in commits_files.items():
         raw_files_list = []
@@ -109,80 +117,167 @@ def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
             if file.get("status") == "added" or file.get("status") == "modified":
                 raw_files_list.append(file)
         relevant_files[commit] = raw_files_list
-
     return relevant_files
 
-def parsing_files_by_feed_type(client:Client, commits_files: dict[str, list], feed_type: str) -> dict[str, list]:
-    relevant_files: dict[str, list[dict]] = {}
+
+def parsing_files_by_feed_type(client: Client, commits_files: dict[str, list], feed_type: str) -> dict[str, list]:
+    # Find out if the commit ID is relevant
+    feed_type_files: dict[str, list[dict]] = {}
+    res = []
     for commit, files in commits_files.items():
-        raw_files_data_list = []
+        content_files_list = []
         for file in files:
             format_file = file.get("filename").split(".")[-1]
             if format_file == feed_type:
-                url = file.get("raw_url")
-                res = client._http_request('GET', full_url=url)
-                x = {file.get("filename"): res.text}
-                raw_files_data_list.append(x)
-                
+                content_file = client._http_request("GET", full_url=file.get("raw_url"), resp_type="text")
+                res.append(content_file)
+                content_files_list.append({file.get("filename"): content_file})
+        feed_type_files[commit] = content_files_list
+    return res
 
-                # raw_files_data_list.append({file.get("filename"): file.get("patch")})
-        relevant_files[commit] = raw_files_data_list
-    return relevant_files
 
-        
-def parse_yara(data: dict[str, list[dict[str,str]]]):
+def parse_yara(data: dict[str, list[dict[str, str]]]):
     mapping_result: dict[str, dict] = {}
-    for commit_sha , files in data.items():
+    for commit_sha, files in data.items():
         for file in files:
             rules_result_per_file = {}
             for file_name, content in file.items():
-                res = pars_and_map_yara_content(content)
+                res = parse_and_map_yara_content(content)
                 rules_result_per_file[file_name] = res
         mapping_result[commit_sha] = rules_result_per_file
-    # demisto.results(mapping_result)
     return mapping_result
-        
-def pars_and_map_yara_content(content_item:str) -> list:
-    pattern = re.compile(rf"(?={re.escape('rule')})")
-    content_file = pattern.split(content_item)
+
+
+def parse_and_map_yara_content(content_item: str) -> list:
+    pattern = re.compile(r"rule\s+\w+\s*?\{(?:.*?\n)*?\}", re.DOTALL)
+    content_file = pattern.findall(content_item)
     res = []
     for rule in content_file:
         res.append(mapping_yara_rule(rule))
     return res
 
+
 def mapping_yara_rule(raw_rule: str) -> dict:
-    raw_rule.replace("condition:\n+\t\t( ", "condition:")
     patterns = {
-        "value": re.compile(r"rule\s+?(\S*?)\s"),
-        "description": re.compile(r"description\s*?=\s*[\"](.*?)[\"]"),
-        "author": re.compile(r"author\s*?=\s*[\"](.*?)[\"]"),
-        "references": re.compile(r"reference\s*?=\s*[\"](.*?)[\"]"),
-        "sourcetimestamp": re.compile(r"date\s*?=\s*[\"](.*?)[\"]"),
-        "id": re.compile(r"id\s*?=\s*[\"](.*?)[\"]"),
-        "rule_strings": re.compile(r"[$]s\d+?\s*=\s*?(\S.*?)$"),
-        "condition": re.compile(r"condition:\s*?(\w.*?)(?:$|})"),
-        # "raw_rule": r".*",  # For the entire text
+        "value": r"rule\s+?(\S*?)\s",
+        "description": r"description\s*?=\s*[\"](.*?)[\"]",
+        "author": r"author\s*?=\s*[\"](.*?)[\"]",
+        "references": r"reference\s*?=\s*[\"](.*?)[\"]",
+        "sourcetimestamp": r"date\s*?=\s*[\"](.*?)[\"]",
+        "id": r"id\s*?=\s*[\"](.*?)[\"]",
+        "rule_strings": r"[$]s\d+?\s*=\s*(\S.*?)$",
+        "condition": r"condition:\s*(.+?)(?:$|})",
     }
     results = {}
     for field, pattern in patterns.items():
-        matches = pattern.findall(raw_rule, re.MULTILINE)
+        matches = re.findall(pattern, raw_rule, re.MULTILINE)
         results[field] = matches
     results["raw_rule"] = raw_rule
     return results
+
 
 def get_commits_files(client: Client, feed_type: str) -> dict[str, list]:
     list_commits = client.get_list_commits()
     all_commits_files = client.get_files_per_commit(list_commits)
     relevant_files = parsing_files_by_status(all_commits_files)
-    yara_files_data = parsing_files_by_feed_type(client, relevant_files, "yar")
-    indicators = parse_yara(yara_files_data)
-    return indicators # type: ignore
+    feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type)
+    return feed_type_content_files
 
 
-def get_yara_indicator(client: Client, feed_type: str = "AUTO"):
-    pars_data = get_commits_files(client, feed_type)
-    return pars_data
-    # demisto.results(f"the gihub files result is: {json.dumps(pars_data)}")
+def get_yara_indicator(content: str):
+    return parse_and_map_yara_content(content)
+
+
+def detect_domain_type(domain: str):
+    try:
+        import tldextract
+    except Exception:
+        raise Exception(
+            "Missing tldextract module, In order to use the auto detect function please use a docker"
+            " image with it installed such as: demisto/jmespath"
+        )
+    try:
+        tldextract_version = tldextract.__version__
+        if LooseVersion(tldextract_version) < "3.0.0":
+            no_cache_extract = tldextract.TLDExtract(cache_file=False, suffix_list_urls=None)
+        else:
+            no_cache_extract = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=None)
+
+        if no_cache_extract(domain).suffix:
+            if "*" in domain:
+                return FeedIndicatorType.DomainGlob
+            return FeedIndicatorType.Domain
+
+    except Exception:
+        demisto.debug("tldextract failed to detect indicator type. indicator value: {}".format(domain))
+    return None
+
+
+regex_indicators = [
+    (ipv4cidrRegex, FeedIndicatorType.CIDR),
+    (ipv6Regex, FeedIndicatorType.IPv6),
+    (ipv6cidrRegex, FeedIndicatorType.IPv6CIDR),
+    (emailRegex, FeedIndicatorType.Email),
+    (cveRegex, FeedIndicatorType.CVE),
+    (md5Regex, FeedIndicatorType.File),
+    (sha1Regex, FeedIndicatorType.File),
+    (sha256Regex, FeedIndicatorType.File),
+    (sha512Regex, FeedIndicatorType.File),
+]
+
+regex_with_groups = [
+    (ipv4Regex, FeedIndicatorType.IP, "ipv4"),
+    (urlRegex, FeedIndicatorType.URL, "url_with_path"),
+    (domainRegex, detect_domain_type, "fqdn"),
+]
+
+
+def extract_text_indicators(content: str):
+    content = content.replace("[.]", ".").replace("[@]", "@")  # Refang indicator prior to checking
+    indicators = []
+    for regex, type in regex_indicators:
+        matches = re.findall(regex, content)
+        if matches:
+            indicators += [{match: type} for match in matches]
+    for regex, type, group_name in regex_with_groups:
+        matches = re.finditer(regex, content)
+        if matches:
+            for match in matches:
+                if regex == ipv4Regex:
+                    indicators.append({match.group(group_name): type})
+                elif regex == urlRegex:
+                    indicators.append({match.group(group_name): type})
+                elif regex == domainRegex:
+                    regex_type = type(match.group(group_name))
+                    if regex_type:
+                        indicators.append({match.group(group_name): regex_type})
+    return indicators
+
+
+def identify_json_structure(json_data: str) -> str:
+    """
+    Determine if JSON data represents Envelope or Bundle structure.
+
+    Parameters:
+    - json_data (list or dict): JSON data to be analyzed.
+
+    Returns:
+    - str: "Envelope" if JSON is a list of dicts, "Bundle" if it's a dict with "metadata" and "entries" keys, "Unknown" otherwise.
+    """
+    if isinstance(json_data, list) and all(isinstance(entry, dict) for entry in json_data):
+        return "Envelope"
+    elif isinstance(json_data, dict) and "metadata" in json_data and "entries" in json_data:
+        return "Bundle"
+    else:
+        return "Unknown"
+
+
+def filtering_stix_files(content_files: list) -> list:
+    stix_files = []
+    for file in content_files:
+        if identify_json_structure(file) in ("Envelope", "Bundle"):
+            stix_files.append(file)
+    return stix_files
 
 
 def test_module(client: Client) -> str:
@@ -193,7 +288,7 @@ def test_module(client: Client) -> str:
         Outputs.
     """
     client._http_request("GET", full_url=client._base_url)
-    
+
     return "ok"
 
 
@@ -252,7 +347,7 @@ def fetch_indicators(client: Client, tlp_color: Optional[str] = None, feed_tags:
     return indicators
 
 
-def get_indicators_command(client: Client, feed_type: str='AUTO') -> CommandResults:
+def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandResults:
     """Wrapper for retrieving indicators from the feed to the war-room.
     Args:
         client: Client object with request
@@ -263,15 +358,25 @@ def get_indicators_command(client: Client, feed_type: str='AUTO') -> CommandResu
     """
     args = demisto.args()
 
-    indicators = {}
+    indicators = []
     try:
         if feed_type == "YARA":
-            indicators=get_yara_indicator(client, feed_type)
-            demisto.debug(indicators)
+            content_files = get_commits_files(client, "yar")
+            for file in content_files:
+                indicators.append(get_yara_indicator(file))
+            demisto.debug(f"YARA indicators : {indicators}")
 
-        if feed_type == "STIX":
-            demisto.results("@@@@@@@@@")
-        demisto.debug(f"undicators: {indicators}")
+        elif feed_type == "STIX":
+            content_files = get_commits_files(client, "json")
+            content_files = filtering_stix_files(content_files)
+
+        elif feed_type == "AUTO":
+            content_files = get_commits_files(client, "txt")
+            for file in content_files:
+                indicators += extract_text_indicators(file)
+            demisto.debug(f"IOCs` indicators : {indicators}")
+
+        demisto.debug(f"indicators: {indicators}")
         return CommandResults(
             outputs_key_field="githubfeed",
             raw_response=indicators,
@@ -282,12 +387,11 @@ def get_indicators_command(client: Client, feed_type: str='AUTO') -> CommandResu
         demisto.debug(str(err))
         raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
     # client.build_iterator()
-    '''
+    """
     tlp_color = args.get("tlp_color")
     feed_tags = argToList(args.get("feedTags", ""))
     indicators = fetch_indicators(client, tlp_color, feed_tags, limit)
-    '''
-    
+    """
 
 
 def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dict]:
@@ -310,15 +414,6 @@ def main():
     """
 
     params = demisto.params()
-
-    # Get the service API url
-
-    # If your Client class inherits from BaseClient, SSL verification is
-    # handled out of the box by it, just pass ``verify_certificate`` to
-    # the Client constructor
-
-    # If your Client class inherits from BaseClient, system proxy is handled
-    # out of the box by it, just pass ``proxy`` to the Client constructor
 
     command = demisto.command()
 
@@ -347,16 +442,12 @@ def main():
         )
 
         if command == "test-module":
-            # This is the call made when pressing the integration Test button.
             return_results(test_module(client))
 
         elif command == "github-get-indicators":
-            return_results(get_indicators_command(client, feed_type)) # type: ignore
+            return_results(get_indicators_command(client, feed_type))  # type: ignore
 
         elif command == "fetch-indicators":
-            # This is the command that initiates a request to the feed endpoint and create new indicators objects from
-            # the data fetched. If the integration instance is configured to fetch indicators, then this is the command
-            # that will be executed at the specified feed fetch interval.
             indicators = fetch_indicators_command(client, params)
             for iter_ in batch(indicators, batch_size=2000):
                 demisto.createIndicators(iter_)
