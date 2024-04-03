@@ -2,6 +2,9 @@ import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401
 
 
+CONTEXT_PREFIX = "GITHUB"
+
+
 class Client(BaseClient):
     """Client class to interact with the service API
 
@@ -16,7 +19,7 @@ class Client(BaseClient):
         base_url = urljoin(base_url, f"/repos/{owner}/{repo}/commits")
         super().__init__(base_url=base_url, verify=verify, proxy=proxy, headers=headers)
 
-    def get_list_commits(self, params=[]) -> None:
+    def get_list_commits(self, last_fetch, params=[]) -> list:
         """
         Retrieves a list of commits from the GitHub repository.
 
@@ -32,8 +35,15 @@ class Client(BaseClient):
         Raises:
             Any exceptions raised by the `_http_request` method.
         """
-        res = self._http_request("GET", full_url=self._base_url, params=params)
-
+        current_date = datetime.now().isoformat()
+        if last_fetch:
+            full_url = self._base_url + f"?since={last_fetch}&until={current_date}"
+        else:
+            full_url = self._base_url
+        res = self._http_request("GET", full_url=full_url, params=params)
+        last_run_commit_sha = demisto.getLastRun().get("sha")
+        if res[-1].get("sha") == last_run_commit_sha:
+            return res[:-1]
         return res
 
     def get_files_per_commit(self, list_commits) -> dict[str, list]:
@@ -176,14 +186,24 @@ def mapping_yara_rule(raw_rule: str) -> dict:
     return results
 
 
-def get_commits_files(client: Client, feed_type: str) -> dict[str, list]:
-    list_commits = client.get_list_commits()
-    all_commits_files = client.get_files_per_commit(list_commits)
-    relevant_files = parsing_files_by_status(all_commits_files)
-    feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type)
-    return feed_type_content_files
+def extract_last_commit_info(list_commits):
+    last_date = list_commits[0].get("commit", "").get("author", "").get("date", "")
+    last_commit_sha = list_commits[0].get("sha", "")
+    return {"date": last_date, "sha": last_commit_sha}
 
 
+def get_commits_files(client: Client, feed_type: str, last_fetch) -> tuple[dict[str, list], dict]:
+    list_commits = client.get_list_commits(last_fetch)
+    try:
+        last_commit_info = extract_last_commit_info(list_commits)
+        all_commits_files = client.get_files_per_commit(list_commits)
+        relevant_files = parsing_files_by_status(all_commits_files)
+        feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type)
+        return feed_type_content_files, last_commit_info
+    except IndexError:
+        return {}, {}
+    
+    
 def get_yara_indicator(content: str):
     return parse_and_map_yara_content(content)
 
@@ -213,12 +233,19 @@ def detect_domain_type(domain: str):
     return None
 
 
+ipv4Regex = (
+    r"(?P<ipv4>(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))[:]?(?P<port>\d+)?"
+)
+ipv4cidrRegex = r"([0-9]{1,3}\.){3}[0-9]{1,3}(\/([0-9]|[1-2][0-9]|3[0-2]))"
+ipv6Regex = r"(?:(?:[0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:(?:(:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))"  # noqa: E501
+ipv6cidrRegex = r"s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]d|1dd|[1-9]?d)(.(25[0-5]|2[0-4]d|1dd|[1-9]?d)){3}))|:)))(%.+)?s*(\/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))"  # noqa: E501
+
 regex_indicators = [
     (ipv4cidrRegex, FeedIndicatorType.CIDR),
     (ipv6Regex, FeedIndicatorType.IPv6),
     (ipv6cidrRegex, FeedIndicatorType.IPv6CIDR),
     (emailRegex, FeedIndicatorType.Email),
-    (cveRegex, FeedIndicatorType.CVE),
+    (re.compile(cveRegex, re.M), FeedIndicatorType.CVE),
     (md5Regex, FeedIndicatorType.File),
     (sha1Regex, FeedIndicatorType.File),
     (sha256Regex, FeedIndicatorType.File),
@@ -236,21 +263,19 @@ def extract_text_indicators(content: str):
     content = content.replace("[.]", ".").replace("[@]", "@")  # Refang indicator prior to checking
     indicators = []
     for regex, type in regex_indicators:
-        matches = re.findall(regex, content)
+        matches = re.finditer(regex, content)
         if matches:
-            indicators += [{match: type} for match in matches]
+            indicators += [{"value": match.group(0), "type": type} for match in matches]
     for regex, type, group_name in regex_with_groups:
         matches = re.finditer(regex, content)
         if matches:
             for match in matches:
-                if regex == ipv4Regex:
-                    indicators.append({match.group(group_name): type})
-                elif regex == urlRegex:
-                    indicators.append({match.group(group_name): type})
+                if regex in (ipv4Regex, urlRegex):
+                    indicators.append({"value": match.group(group_name), "type": type})
                 elif regex == domainRegex:
                     regex_type = type(match.group(group_name))
                     if regex_type:
-                        indicators.append({match.group(group_name): regex_type})
+                        indicators.append({"value": match.group(group_name), "type": regex_type})
     return indicators
 
 
@@ -292,7 +317,9 @@ def test_module(client: Client) -> str:
     return "ok"
 
 
-def fetch_indicators(client: Client, tlp_color: Optional[str] = None, feed_tags: List = [], limit: int = -1) -> List[Dict]:
+def fetch_indicators(
+    client: Client, last_fetch, feed_type: str = "AUTO", tlp_color: Optional[str] = None, feed_tags: List = [], limit: int = -1
+) -> List[Dict]:
     """Retrieves indicators from the feed
     Args:
         client (Client): Client object with request
@@ -302,7 +329,8 @@ def fetch_indicators(client: Client, tlp_color: Optional[str] = None, feed_tags:
     Returns:
         Indicators.
     """
-    iterator = client.build_iterator()
+    demisto.debug(f"Before fetch command last run: {last_fetch}")
+    iterator, last_commit_info = get_indicators(client, feed_type, last_fetch)
     indicators = []
     if limit > 0:
         iterator = iterator[:limit]
@@ -343,8 +371,38 @@ def fetch_indicators(client: Client, tlp_color: Optional[str] = None, feed_tags:
             indicator_obj["fields"]["trafficlightprotocol"] = tlp_color
 
         indicators.append(indicator_obj)
+    demisto.debug(f"After fetch command last run: {last_commit_info}")
+    if last_commit_info:
+        demisto.setLastRun(last_commit_info)
 
     return indicators
+
+
+def get_indicators(client: Client, feed_type, last_fetch=None):
+    indicators = []
+    try:
+        if feed_type == "YARA":
+            content_files, last_commit_info = get_commits_files(client, "yar", last_fetch)
+            for file in content_files:
+                indicators.append(get_yara_indicator(file))
+            demisto.debug(f"YARA indicators : {indicators}")
+
+        elif feed_type == "STIX":
+            # content_files, last_commit_info = get_commits_files(client, "json", last_fetch)
+            # content_files = filtering_stix_files(content_files)
+            pass
+
+        elif feed_type == "AUTO":
+            content_files, last_commit_info = get_commits_files(client, "txt", last_fetch)
+            for file in content_files:
+                indicators += extract_text_indicators(file)
+            # indicators += extract_text_indicators(str((demisto.params()).get('data')))
+            demisto.debug(f"IOCs` indicators : {indicators}")
+
+    except Exception as err:
+        demisto.debug(str(err))
+        raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
+    return indicators, last_commit_info
 
 
 def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandResults:
@@ -356,28 +414,13 @@ def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandRe
     Returns:
         Outputs.
     """
-    args = demisto.args()
-
     indicators = []
     try:
-        if feed_type == "YARA":
-            content_files = get_commits_files(client, "yar")
-            for file in content_files:
-                indicators.append(get_yara_indicator(file))
-            demisto.debug(f"YARA indicators : {indicators}")
-
-        elif feed_type == "STIX":
-            content_files = get_commits_files(client, "json")
-            content_files = filtering_stix_files(content_files)
-
-        elif feed_type == "AUTO":
-            content_files = get_commits_files(client, "txt")
-            for file in content_files:
-                indicators += extract_text_indicators(file)
-            demisto.debug(f"IOCs` indicators : {indicators}")
+        indicators, _ = get_indicators(client=client, feed_type=feed_type)
 
         demisto.debug(f"indicators: {indicators}")
         return CommandResults(
+            outputs_prefix=CONTEXT_PREFIX + ".Indicators",
             outputs_key_field="githubfeed",
             raw_response=indicators,
             outputs=indicators,
@@ -387,11 +430,6 @@ def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandRe
         demisto.debug(str(err))
         raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
     # client.build_iterator()
-    """
-    tlp_color = args.get("tlp_color")
-    feed_tags = argToList(args.get("feedTags", ""))
-    indicators = fetch_indicators(client, tlp_color, feed_tags, limit)
-    """
 
 
 def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dict]:
@@ -404,7 +442,9 @@ def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dic
     """
     feed_tags = argToList(params.get("feedTags", ""))
     tlp_color = params.get("tlp_color")
-    indicators = fetch_indicators(client, tlp_color, feed_tags)
+    feed_type = str(params.get("feedType"))
+    last_run = demisto.getLastRun().get("date", None)
+    indicators = fetch_indicators(client, last_run, feed_type=feed_type, tlp_color=tlp_color, feed_tags=feed_tags)
     return indicators
 
 
@@ -428,8 +468,10 @@ def main():
     proxy = params.get("proxy", False)
     owner = str(params.get("owner"))
     repo = str(params.get("repo"))
-    headers = {"Accept": "application/vnd.github+json"}
-    feed_type = params.get("feedType")
+    api_token = str(params.get("api_token"))
+    headers = {"Accept": "application/vnd.github+json",
+               "Authorization": f"Bearer {api_token}"}
+    feed_type = str(params.get("feedType"))
 
     try:
         client = Client(
@@ -445,7 +487,7 @@ def main():
             return_results(test_module(client))
 
         elif command == "github-get-indicators":
-            return_results(get_indicators_command(client, feed_type))  # type: ignore
+            return_results(get_indicators_command(client, feed_type))
 
         elif command == "fetch-indicators":
             indicators = fetch_indicators_command(client, params)
@@ -455,7 +497,6 @@ def main():
         else:
             raise NotImplementedError(f"Command {command} is not implemented.")
 
-    # Log exceptions and return errors
     except Exception as e:
         demisto.error(traceback.format_exc())  # Print the traceback
         return_error(f"Failed to execute {command} command.\nError:\n{str(e)}")
