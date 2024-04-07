@@ -1,5 +1,6 @@
 import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401
+from TAXII2ApiModule import *
 
 
 CONTEXT_PREFIX = "GITHUB"
@@ -130,7 +131,7 @@ def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
     return relevant_files
 
 
-def parsing_files_by_feed_type(client: Client, commits_files: dict[str, list], feed_type: str) -> dict[str, list]:
+def parsing_files_by_feed_type(client: Client, commits_files: dict[str, list], feed_type: str, resp_type: str) -> dict[str, list]:
     # Find out if the commit ID is relevant
     feed_type_files: dict[str, list[dict]] = {}
     res = []
@@ -139,7 +140,7 @@ def parsing_files_by_feed_type(client: Client, commits_files: dict[str, list], f
         for file in files:
             format_file = file.get("filename").split(".")[-1]
             if format_file == feed_type:
-                content_file = client._http_request("GET", full_url=file.get("raw_url"), resp_type="text")
+                content_file = client._http_request("GET", full_url=file.get("raw_url"), resp_type=resp_type)
                 res.append(content_file)
                 content_files_list.append({file.get("filename"): content_file})
         feed_type_files[commit] = content_files_list
@@ -192,18 +193,18 @@ def extract_last_commit_info(list_commits):
     return {"date": last_date, "sha": last_commit_sha}
 
 
-def get_commits_files(client: Client, feed_type: str, last_fetch) -> tuple[dict[str, list], dict]:
+def get_commits_files(client: Client, feed_type: str, last_fetch, resp_type: str = "text") -> tuple[dict[str, list], dict]:
     list_commits = client.get_list_commits(last_fetch)
     try:
         last_commit_info = extract_last_commit_info(list_commits)
         all_commits_files = client.get_files_per_commit(list_commits)
         relevant_files = parsing_files_by_status(all_commits_files)
-        feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type)
+        feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type, resp_type)
         return feed_type_content_files, last_commit_info
     except IndexError:
         return {}, {}
-    
-    
+
+
 def get_yara_indicator(content: str):
     return parse_and_map_yara_content(content)
 
@@ -279,31 +280,71 @@ def extract_text_indicators(content: str):
     return indicators
 
 
-def identify_json_structure(json_data: str) -> str:
+def identify_json_structure(json_data: dict) -> Any:
     """
-    Determine if JSON data represents Envelope or Bundle structure.
+    Identify the structure of a JSON data.
 
-    Parameters:
-    - json_data (list or dict): JSON data to be analyzed.
+    Args:
+        json_data (dict): A dictionary representing the JSON data.
 
     Returns:
-    - str: "Envelope" if JSON is a list of dicts, "Bundle" if it's a dict with "metadata" and "entries" keys, "Unknown" otherwise.
+        Any: The identified structure of the JSON data. Possible values are:
+             - "Bundle": If the JSON data is structured as a STIX Bundle.
+             - "Envelope": If the JSON data is structured as a STIX Envelope.
+             - dict: If the JSON data contains a list of STIX objects, returns a dictionary with the key "objects"
+                     and the list of objects as its value.
+             - None: If the structure cannot be identified.
     """
-    if isinstance(json_data, list) and all(isinstance(entry, dict) for entry in json_data):
-        return "Envelope"
-    elif isinstance(json_data, dict) and "metadata" in json_data and "entries" in json_data:
+    if isinstance(json_data, dict) and json_data.get("bundle"):
         return "Bundle"
-    else:
-        return "Unknown"
+    if isinstance(json_data, dict) and json_data.get("objects"):
+        return "Envelope"
+    if isinstance(json_data, list) and all([json_data[0].get("type"), json_data[0].get("id")]):
+        return {"objects": json_data}
+    return None
 
 
 def filtering_stix_files(content_files: list) -> list:
+    """
+    Filter a list of JSON files to include only STIX files.
+
+    Args:
+        content_files (list): A list of JSON files.
+
+    Returns:
+        list: A filtered list containing only STIX files or objects. If an object is identified as a STIX Envelope or Bundle,
+              it is included as-is. If an object contains a list of STIX objects, it is included with the key "objects" in
+              a dictionary.
+    """
     stix_files = []
     for file in content_files:
-        if identify_json_structure(file) in ("Envelope", "Bundle"):
+        file_type = identify_json_structure(file)
+        if file_type in ("Envelope", "Bundle"):
             stix_files.append(file)
+        if isinstance(file_type, dict):
+            stix_files.append(file_type)
     return stix_files
 
+
+def create_generator(content_files):
+    """
+    Create a generator for iterating over STIX files.
+
+    This function takes a list of JSON files, filters them to include only STIX files, and then
+    creates a generator that yields each STIX file or object one at a time.
+
+    Args:
+        content_files (list): A list of JSON files.
+
+    Returns:
+        Generator: A generator that yields each STIX file from the filtered list one at a time.
+    """
+    stix_files = filtering_stix_files(content_files)
+    return get_stix_files_generator(stix_files)
+
+
+def get_stix_files_generator(json_files):
+    yield from json_files
 
 def test_module(client: Client) -> str:
     """Builds the iterator to check that the feed is accessible.
@@ -320,14 +361,19 @@ def test_module(client: Client) -> str:
 def fetch_indicators(
     client: Client, last_fetch, feed_type: str = "AUTO", tlp_color: Optional[str] = None, feed_tags: List = [], limit: int = -1
 ) -> List[Dict]:
-    """Retrieves indicators from the feed
+    """
+    Fetch indicators from the feed.
+
     Args:
-        client (Client): Client object with request
-        tlp_color (str): Traffic Light Protocol color
-        feed_tags (list): tags to assign fetched indicators
-        limit (int): limit the results
+        client (Client): The HTTP client instance.
+        last_fetch (str): The timestamp indicating when the fetch was last executed.
+        feed_type (str): The type of feed to fetch. Default is "AUTO".
+        tlp_color (str): The Traffic Light Protocol (TLP) color to assign to the fetched indicators.
+        feed_tags (List): List of tags to assign to the fetched indicators.
+        limit (int): Limit the number of fetched indicators. Default is -1, indicating no limit.
+
     Returns:
-        Indicators.
+        List[Dict]: A list of dictionaries representing the fetched indicators.
     """
     demisto.debug(f"Before fetch command last run: {last_fetch}")
     iterator, last_commit_info = get_indicators(client, feed_type, last_fetch)
@@ -349,18 +395,13 @@ def fetch_indicators(
         for key, value in item.items():
             raw_data.update({key: value})
         indicator_obj = {
-            # The indicator value.
             "value": value_,
-            # The indicator type as defined in Cortex XSOAR.
-            # One can use the FeedIndicatorType class under CommonServerPython to populate this field.
             "type": type_,
-            # The name of the service supplying this feed.
             "service": "github",
             # A dictionary that maps values to existing indicator fields defined in Cortex XSOAR.
             # One can use this section in order to map custom indicator fields previously defined
             # in Cortex XSOAR to their values.
             "fields": {},
-            # A dictionary of the raw data returned from the feed source about the indicator.
             "rawJSON": raw_data,
         }
 
@@ -388,16 +429,22 @@ def get_indicators(client: Client, feed_type, last_fetch=None):
             demisto.debug(f"YARA indicators : {indicators}")
 
         elif feed_type == "STIX":
-            # content_files, last_commit_info = get_commits_files(client, "json", last_fetch)
-            # content_files = filtering_stix_files(content_files)
-            pass
+            stix_client = STIX2XSOARParser({})
+            # content_files, last_commit_info = get_commits_files(client, "json", last_fetch, 'json')
+            content_files = eval((demisto.params()).get("data"))
 
-        elif feed_type == "AUTO":
+            generator_stix_files = create_generator(content_files)
+            indicators += stix_client.load_stix_objects_from_envelope(generator_stix_files)
+            last_commit_info = None
+
+        elif feed_type == "IOCs":
             content_files, last_commit_info = get_commits_files(client, "txt", last_fetch)
             for file in content_files:
                 indicators += extract_text_indicators(file)
             # indicators += extract_text_indicators(str((demisto.params()).get('data')))
             demisto.debug(f"IOCs` indicators : {indicators}")
+        else:
+            pass
 
     except Exception as err:
         demisto.debug(str(err))
@@ -469,8 +516,7 @@ def main():
     owner = str(params.get("owner"))
     repo = str(params.get("repo"))
     api_token = str(params.get("api_token"))
-    headers = {"Accept": "application/vnd.github+json",
-               "Authorization": f"Bearer {api_token}"}
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {api_token}"}
     feed_type = str(params.get("feedType"))
 
     try:
