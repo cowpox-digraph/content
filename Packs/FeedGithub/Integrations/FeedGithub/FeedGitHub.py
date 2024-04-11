@@ -1,9 +1,15 @@
 import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401
 from TAXII2ApiModule import *
-
+import plyara
 
 CONTEXT_PREFIX = "GITHUB"
+
+FEED_TYPE = {
+    "YARA": "yar",
+    "STIX": "stix",
+    "IOCs": "iocs",
+}
 
 
 class Client(BaseClient):
@@ -67,45 +73,7 @@ class Client(BaseClient):
         Raises:
             Any exceptions raised by the `_http_request` method.
         """
-        return {commit["sha"]: self._http_request("GET", commit["sha"]).get("files", []) for commit in list_commits[:2]}
-
-    def build_iterator(self) -> List:
-        """Retrieves all entries from the feed.
-        Returns:
-            A list of objects, containing the indicators.
-        """
-
-        result = []
-
-        res = self._http_request(
-            "GET",
-            url_suffix="",
-            full_url=self._base_url,
-            resp_type="text",
-        )
-
-        # In this case the feed output is in text format, so extracting the indicators from the response requires
-        # iterating over it's lines solely. Other feeds could be in other kinds of formats (CSV, MISP, etc.), or might
-        # require additional processing as well.
-        try:
-            indicators = res.split("\n")
-
-            for indicator in indicators:
-                # Infer the type of the indicator using 'auto_detect_indicator_type(indicator)' function
-                # (defined in CommonServerPython).
-                if auto_detect_indicator_type(indicator):
-                    result.append(
-                        {
-                            "value": indicator,
-                            "type": auto_detect_indicator_type(indicator),
-                            "FeedURL": self._base_url,
-                        }
-                    )
-
-        except ValueError as err:
-            demisto.debug(str(err))
-            raise ValueError(f"Could not parse returned data as indicator. \n\nError message: {err}")
-        return result
+        return {commit["sha"]: self._http_request("GET", commit["sha"]).get("files", []) for commit in list_commits}
 
 
 def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
@@ -131,60 +99,37 @@ def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
     return relevant_files
 
 
-def parsing_files_by_feed_type(client: Client, commits_files: dict[str, list], feed_type: str, resp_type: str) -> dict[str, list]:
-    # Find out if the commit ID is relevant
-    feed_type_files: dict[str, list[dict]] = {}
-    res = []
-    for commit, files in commits_files.items():
-        content_files_list = []
-        for file in files:
-            format_file = file.get("filename").split(".")[-1]
-            if format_file == feed_type:
-                content_file = client._http_request("GET", full_url=file.get("raw_url"), resp_type=resp_type)
-                res.append(content_file)
-                content_files_list.append({file.get("filename"): content_file})
-        feed_type_files[commit] = content_files_list
-    return res
+def get_files_names(commits_files: dict[str, list]) -> list:
+    return [file.get("raw_url") for _, files in commits_files.items() for file in files]
 
 
-def parse_yara(data: dict[str, list[dict[str, str]]]):
-    mapping_result: dict[str, dict] = {}
-    for commit_sha, files in data.items():
-        for file in files:
-            rules_result_per_file = {}
-            for file_name, content in file.items():
-                res = parse_and_map_yara_content(content)
-                rules_result_per_file[file_name] = res
-        mapping_result[commit_sha] = rules_result_per_file
-    return mapping_result
+def get_files_token(client: Client, relevant_files: list[str], format_files: str = None):  # type: ignore
+    if format_files:
+        relevant_files = [file for file in relevant_files if file.endswith(format_files)]
+    return [client._http_request("GET", full_url=file, resp_type="text") for file in relevant_files]
 
 
 def parse_and_map_yara_content(content_item: str) -> list:
     pattern = re.compile(r"rule\s+\w+\s*?\{(?:.*?\n)*?\}", re.DOTALL)
-    content_file = pattern.findall(content_item)
-    res = []
-    for rule in content_file:
-        res.append(mapping_yara_rule(rule))
-    return res
-
-
-def mapping_yara_rule(raw_rule: str) -> dict:
-    patterns = {
-        "value": r"rule\s+?(\S*?)\s",
-        "description": r"description\s*?=\s*[\"](.*?)[\"]",
-        "author": r"author\s*?=\s*[\"](.*?)[\"]",
-        "references": r"reference\s*?=\s*[\"](.*?)[\"]",
-        "sourcetimestamp": r"date\s*?=\s*[\"](.*?)[\"]",
-        "id": r"id\s*?=\s*[\"](.*?)[\"]",
-        "rule_strings": r"[$]s\d+?\s*=\s*(\S.*?)$",
-        "condition": r"condition:\s*(.+?)(?:$|})",
-    }
-    results = {}
-    for field, pattern in patterns.items():
-        matches = re.findall(pattern, raw_rule, re.MULTILINE)
-        results[field] = matches
-    results["raw_rule"] = raw_rule
-    return results
+    content_rules = pattern.findall(content_item)
+    parsed_rules = []
+    for rule in content_rules:
+        parser = plyara.Plyara()
+        parsed_rule = parser.parse_string(rule)[0]
+        metadata = {key: value for d in parsed_rule["metadata"] for key, value in d.items()}
+        mapper = {
+            "value": parsed_rule["rule_name"],
+            "description": metadata.get("description", ""),
+            "author": metadata.get("author", ""),
+            "references": metadata.get("reference", ""),
+            "sourcetimestamp": metadata.get("date", ""),
+            "id": metadata.get("id", ""),
+            "rule_strings": parsed_rule.get("strings", []),
+            "condition": " ".join(parsed_rule["condition_terms"]),
+            "raw rule": rule,
+        }
+        parsed_rules.append(mapper)
+    return parsed_rules
 
 
 def extract_last_commit_info(list_commits):
@@ -193,20 +138,38 @@ def extract_last_commit_info(list_commits):
     return {"date": last_date, "sha": last_commit_sha}
 
 
-def get_commits_files(client: Client, feed_type: str, last_fetch, resp_type: str = "text") -> tuple[dict[str, list], dict]:
+def get_commits_files(client: Client, last_fetch) -> tuple[list, dict]:
+    """
+    Retrieve files from commits based on the last fetch timestamp.
+
+    Args:
+        client (Client): The client to interact with the source.
+        last_fetch (str): The timestamp of the last fetch.
+
+    Returns:
+        tuple[list, dict]: A tuple containing a list of content files and a dictionary with information
+                           about the last commit.
+
+    Raises:
+        IndexError: If an index error occurs during the extraction of last commit information.
+
+    """
     list_commits = client.get_list_commits(last_fetch)
     try:
         last_commit_info = extract_last_commit_info(list_commits)
         all_commits_files = client.get_files_per_commit(list_commits)
         relevant_files = parsing_files_by_status(all_commits_files)
-        feed_type_content_files = parsing_files_by_feed_type(client, relevant_files, feed_type, resp_type)
-        return feed_type_content_files, last_commit_info
+        feed_files_raw_url = get_files_names(relevant_files)
+        return feed_files_raw_url, last_commit_info
     except IndexError:
-        return {}, {}
+        return [], last_fetch
 
 
-def get_yara_indicator(content: str):
-    return parse_and_map_yara_content(content)
+def get_yara_indicator(content: list):
+    parsed_rules = []
+    for file in content:
+        parsed_rules += parse_and_map_yara_content(file)
+    return parsed_rules
 
 
 def detect_domain_type(domain: str):
@@ -339,12 +302,24 @@ def create_generator(content_files):
     Returns:
         Generator: A generator that yields each STIX file from the filtered list one at a time.
     """
-    stix_files = filtering_stix_files(content_files)
-    return get_stix_files_generator(stix_files)
+    return get_stix_files_generator(filtering_stix_files(content_files))
 
 
 def get_stix_files_generator(json_files):
     yield from json_files
+
+
+def detect_type(relevant_files: list, client: Client) -> str:
+    format_file = relevant_files[0].split(".")[-1]
+    if format_file not in ("yar", "json"):
+        return "iocs"
+    if format_file == "json":
+        raw_json = get_files_token(client, relevant_files[0])
+        if not filtering_stix_files(raw_json):
+            return "iocs"
+        return "stix"
+    return format_file
+
 
 def test_module(client: Client) -> str:
     """Builds the iterator to check that the feed is accessible.
@@ -421,30 +396,27 @@ def fetch_indicators(
 
 def get_indicators(client: Client, feed_type, last_fetch=None):
     indicators = []
+
+    relevant_files, last_commit_info = get_commits_files(client, last_fetch)
+    feed_type = detect_type(relevant_files, client) if feed_type == "AUTO" else FEED_TYPE.get(feed_type)
+    format_file = feed_type if feed_type == "yar" else "json" if feed_type == "stix" else None
+    files_tokens = get_files_token(client, relevant_files, format_file)  # type: ignore
     try:
-        if feed_type == "YARA":
-            content_files, last_commit_info = get_commits_files(client, "yar", last_fetch)
-            for file in content_files:
-                indicators.append(get_yara_indicator(file))
+        if feed_type == "yar":
+            indicators = get_yara_indicator(files_tokens)
             demisto.debug(f"YARA indicators : {indicators}")
 
-        elif feed_type == "STIX":
+        elif feed_type == "stix":
             stix_client = STIX2XSOARParser({})
-            # content_files, last_commit_info = get_commits_files(client, "json", last_fetch, 'json')
-            content_files = eval((demisto.params()).get("data"))
+            files_tokens = eval((demisto.params()).get("data"))
+            generator_stix_files = create_generator(files_tokens)
+            indicators = stix_client.load_stix_objects_from_envelope(generator_stix_files)
 
-            generator_stix_files = create_generator(content_files)
-            indicators += stix_client.load_stix_objects_from_envelope(generator_stix_files)
-            last_commit_info = None
-
-        elif feed_type == "IOCs":
-            content_files, last_commit_info = get_commits_files(client, "txt", last_fetch)
-            for file in content_files:
+        elif feed_type == "iocs":
+            for file in files_tokens:
                 indicators += extract_text_indicators(file)
             # indicators += extract_text_indicators(str((demisto.params()).get('data')))
             demisto.debug(f"IOCs` indicators : {indicators}")
-        else:
-            pass
 
     except Exception as err:
         demisto.debug(str(err))
@@ -476,8 +448,6 @@ def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandRe
     except Exception as err:
         demisto.debug(str(err))
         raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
-    # client.build_iterator()
-
 
 def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dict]:
     """Wrapper for fetching indicators from the feed to the Indicators tab.
@@ -499,16 +469,10 @@ def main():
     """
     main function, parses params and runs command functions
     """
-
     params = demisto.params()
 
     command = demisto.command()
 
-    # INTEGRATION DEVELOPER TIP
-    # You can use functions such as ``demisto.debug()``, ``demisto.info()``,
-    # etc. to print information in the XSOAR server log. You can set the log
-    # level on the server configuration
-    # See: https://xsoar.pan.dev/docs/integrations/code-conventions#logging
     demisto.debug(f"Command being called is {command}")
     base_url = str(params.get("url"))
     verify_certificate = not params.get("insecure", False)
@@ -544,9 +508,9 @@ def main():
             raise NotImplementedError(f"Command {command} is not implemented.")
 
     except Exception as e:
-        demisto.error(traceback.format_exc())  # Print the traceback
+        demisto.error(traceback.format_exc())
         return_error(f"Failed to execute {command} command.\nError:\n{str(e)}")
 
 
-if __name__ in ("__main__", "__builtin__", "builtins"):  # pragma: no cover
+if __name__ in ("__main__", "__builtin__", "builtins"):
     main()
