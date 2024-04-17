@@ -36,11 +36,26 @@ configuration:
   - YARA
   - STIX
   - IOCs
-  - AUTO
   type: 15
   additionalinfo: Predefined list of indicator types
   section: Connect
   required: true
+- display: Head branch name
+  name: branch_head
+  type: 0
+  required: true
+  defaultvalue: main
+  additionalinfo: 'The name of the main branch to which you would like to compare'
+- display: files extensions To Fetch
+  name: extensions_to_fetch
+  type: 16
+  required: true
+  defaultvalue: txt, yar, json
+  options:
+  - txt
+  - yar
+  - json
+  additionalinfo: 'Choosing an extension for the file names you want to target'
 - displaypassword: API Token
   name: api_token
   type: 9

@@ -5,12 +5,6 @@ import plyara
 
 CONTEXT_PREFIX = "GITHUB"
 
-FEED_TYPE = {
-    "YARA": "yar",
-    "STIX": "stix",
-    "IOCs": "iocs",
-}
-
 
 class Client(BaseClient):
     """Client class to interact with the service API
@@ -23,156 +17,162 @@ class Client(BaseClient):
     """
 
     def __init__(self, base_url: str, verify: bool, proxy: bool, owner: str, repo: str, headers: dict):
-        base_url = urljoin(base_url, f"/repos/{owner}/{repo}/commits")
+        base_url = urljoin(base_url, f"/repos/{owner}/{repo}/")
         super().__init__(base_url=base_url, verify=verify, proxy=proxy, headers=headers)
 
-    def get_list_commits(self, last_fetch, params=[]) -> list:
+    def get_repo_base_sha(self) -> str:
         """
-        Retrieves a list of commits from the GitHub repository.
+        Retrieves the SHA of the base commit of the repository.
 
-        This method sends an HTTP GET request to the GitHub API endpoint
-        to retrieve a list of commits from the repository specified by the
-        base URL.
+        This function fetches all commits of the repository and returns the SHA of the latest commit,
+        which represents the base commit of the repository.
 
         Returns:
-            None: This method does not return any value directly. The retrieved
-            commits can be accessed using the `_http_request` method or other
-            appropriate mechanisms.
-
-        Raises:
-            Any exceptions raised by the `_http_request` method.
+            str: The SHA of the base commit of the repository.
         """
-        current_date = datetime.now().isoformat()
-        if last_fetch:
-            full_url = self._base_url + f"?since={last_fetch}&until={current_date}"
-        else:
-            full_url = self._base_url
-        res = self._http_request("GET", full_url=full_url, params=params)
-        last_run_commit_sha = demisto.getLastRun().get("sha")
-        if res[-1].get("sha") == last_run_commit_sha:
-            return res[:-1]
-        return res
+        all_commits = []
+        response = self._http_request("GET", full_url=f"{self._base_url}commits", resp_type="response")
+        while "next" in response.links:
+            data = response.json()
+            all_commits.extend(data)
+            response = self._http_request("GET", full_url=response.links["next"]["url"], resp_type="response")
+        return all_commits[-1]["sha"]
 
-    def get_files_per_commit(self, list_commits) -> dict[str, list]:
+    def get_files_between_commits(self, base: str, head: str) -> list:
         """
-        Retrieves a dictionary containing files changed per commit.
-
-        This method takes a list of commits and sends an HTTP GET request to
-        the GitHub API for each commit to retrieve the list of files changed.
-        It constructs a dictionary where each key is the commit SHA and the
-        corresponding value is a list of files changed in that commit.
+        Retrieves the list of files modified between two commits.
 
         Args:
-            list_commits (List[Dict[str, any]]): A list of dictionaries representing commits.
-                Each dictionary should contain information about a single commit.
+            base (str): The SHA of the base commit.
+            head (str): The SHA of the head commit.
 
         Returns:
-            Dict[str, List[str]]: A dictionary where keys are commit SHA strings and values
-                are lists of file paths changed in each commit.
-
-        Raises:
-            Any exceptions raised by the `_http_request` method.
+            list: A list of files modified between the specified base and head commits.
         """
-        return {commit["sha"]: self._http_request("GET", commit["sha"]).get("files", []) for commit in list_commits}
+        return self._http_request("GET", f"compare/{base}...{head}")["files"]
 
 
-def parsing_files_by_status(commits_files: dict[str, list]) -> dict[str, list]:
+def parsing_files_by_status(commits_files: list) -> list:
     """
-    Parsing files by their status.
+    Parses files from a list of commit files based on their status.
 
     Args:
-        commits_files (Dict[str, List[Dict[str, str]]]): A dictionary where keys are commit SHA strings and values
-            are lists of files changed in each commit.
+        commits_files (list): A list of dictionaries representing commit files.
 
     Returns:
-        Dict[str, List[Dict[str, str]]]: A dictionary where keys are commit SHA strings and values
-            are lists of files that have A status 'added' or 'modified' in each commit.
-
+        list: A list of URLs for files that are added or modified.
     """
-    relevant_files: dict[str, list[dict]] = {}
-    for commit, files in commits_files.items():
-        raw_files_list = []
-        for file in files:
-            if file.get("status") == "added" or file.get("status") == "modified":
-                raw_files_list.append(file)
-        relevant_files[commit] = raw_files_list
+    relevant_files: list[dict] = []
+    for file in commits_files:
+        if file.get("status") == "added" or file.get("status") == "modified":
+            relevant_files.append(file.get("raw_url"))
     return relevant_files
 
 
-def get_files_names(commits_files: dict[str, list]) -> list:
-    return [file.get("raw_url") for _, files in commits_files.items() for file in files]
+def get_files_token(client: Client, relevant_files: list[str]):
+    """
+    Retrieves content of relevant files based on specified extensions.
 
+    Args:
+        client (Client): An instance of the client used for HTTP requests.
+        relevant_files (list): A list of URLs for relevant files.
 
-def get_files_token(client: Client, relevant_files: list[str], format_files: str = None):  # type: ignore
-    if format_files:
-        relevant_files = [file for file in relevant_files if file.endswith(format_files)]
+    Returns:
+        list: A list of file contents fetched via HTTP requests.
+    """
+    extensions_to_fetch = argToList(demisto.params().get("extensions_to_fetch") or [])
+    relevant_files = [file for file in relevant_files if any(file.endswith(ext) for ext in extensions_to_fetch)]
     return [client._http_request("GET", full_url=file, resp_type="text") for file in relevant_files]
 
 
+def get_commits_files(client: Client, last_commit_fetch) -> tuple[list, str]:
+    """
+    Retrieves relevant files modified between commits and the current repository head.
+
+    Args:
+        client (Client): An instance of the client used for interacting with the repository.
+        last_commit_fetch (str): The SHA of the last fetched commit.
+
+    Returns:
+        tuple: A tuple containing a list of relevant file URLs and the SHA of the current repository head.
+    """
+    current_repo_head = demisto.params().get('branch_head')
+    base_repo_sha = last_commit_fetch or client.get_repo_base_sha()
+    try:
+        all_commits_files = client.get_files_between_commits(base_repo_sha, current_repo_head) # type: ignore
+        relevant_files = parsing_files_by_status(all_commits_files)
+        return relevant_files, current_repo_head # type: ignore
+
+    except IndexError:
+        return [], last_commit_fetch
+
+
 def parse_and_map_yara_content(content_item: str) -> list:
+    """
+    Parses YARA rules from a given content item and maps their attributes.
+
+    Args:
+        content_item (str): A string containing one or more YARA rules.
+
+    Returns:
+        list: A list of dictionaries representing parsed and mapped YARA rules.
+              Each dictionary contains attributes such as rule name, description, author, etc.
+    """
     pattern = re.compile(r"rule\s+\w+\s*?\{(?:.*?\n)*?\}", re.DOTALL)
     content_rules = pattern.findall(content_item)
     parsed_rules = []
     for rule in content_rules:
         parser = plyara.Plyara()
-        parsed_rule = parser.parse_string(rule)[0]
-        metadata = {key: value for d in parsed_rule["metadata"] for key, value in d.items()}
-        mapper = {
-            "value": parsed_rule["rule_name"],
-            "description": metadata.get("description", ""),
-            "author": metadata.get("author", ""),
-            "references": metadata.get("reference", ""),
-            "sourcetimestamp": metadata.get("date", ""),
-            "id": metadata.get("id", ""),
-            "rule_strings": parsed_rule.get("strings", []),
-            "condition": " ".join(parsed_rule["condition_terms"]),
-            "raw rule": rule,
-        }
-        parsed_rules.append(mapper)
+        try:
+            parsed_rule = parser.parse_string(rule)[0]
+            metadata = {key: value for d in parsed_rule["metadata"] for key, value in d.items()}
+            mapper = {
+                "value": parsed_rule["rule_name"],
+                "description": metadata.get("description", ""),
+                "author": metadata.get("author", ""),
+                "rulereference": metadata.get("reference", ""),
+                "sourcetimestamp": metadata.get("date", ""),
+                "id": metadata.get("id", ""),
+                "rule strings": parsed_rule.get("strings", []),
+                "condition": " ".join(parsed_rule["condition_terms"]),
+                "type": "YARA",
+                "raw rule": rule,
+            }
+            
+            parsed_rules.append(mapper)
+        except Exception as e:
+            demisto.log(f"Rull: {rule} cannot be processed. Error Message: {e}")
+            continue
     return parsed_rules
-
-
-def extract_last_commit_info(list_commits):
-    last_date = list_commits[0].get("commit", "").get("author", "").get("date", "")
-    last_commit_sha = list_commits[0].get("sha", "")
-    return {"date": last_date, "sha": last_commit_sha}
-
-
-def get_commits_files(client: Client, last_fetch) -> tuple[list, dict]:
-    """
-    Retrieve files from commits based on the last fetch timestamp.
-
-    Args:
-        client (Client): The client to interact with the source.
-        last_fetch (str): The timestamp of the last fetch.
-
-    Returns:
-        tuple[list, dict]: A tuple containing a list of content files and a dictionary with information
-                           about the last commit.
-
-    Raises:
-        IndexError: If an index error occurs during the extraction of last commit information.
-
-    """
-    list_commits = client.get_list_commits(last_fetch)
-    try:
-        last_commit_info = extract_last_commit_info(list_commits)
-        all_commits_files = client.get_files_per_commit(list_commits)
-        relevant_files = parsing_files_by_status(all_commits_files)
-        feed_files_raw_url = get_files_names(relevant_files)
-        return feed_files_raw_url, last_commit_info
-    except IndexError:
-        return [], last_fetch
 
 
 def get_yara_indicator(content: list):
-    parsed_rules = []
-    for file in content:
-        parsed_rules += parse_and_map_yara_content(file)
-    return parsed_rules
+    """
+    Retrieves YARA indicators from a list of content items.
+
+    Args:
+        content (list): A list of strings containing YARA rules.
+
+    Returns:
+        list: A list of dictionaries representing parsed and mapped YARA rules for each content item.
+    """
+    res = []
+    for item in content:
+        res += parse_and_map_yara_content(item)
+    
+    return res
 
 
 def detect_domain_type(domain: str):
+    """
+    Detects the type of an indicator (e.g., Domain, DomainGlob) using tldextract library.
+
+    Args:
+        domain (str): The indicator value to be analyzed.
+
+    Returns:
+        Optional[FeedIndicatorType]: The type of the indicator, or None if detection fails.
+    """
     try:
         import tldextract
     except Exception:
@@ -224,6 +224,16 @@ regex_with_groups = [
 
 
 def extract_text_indicators(content: str):
+    """
+    Extracts indicators from text content using predefined regular expressions.
+
+    Args:
+        content (str): The text content to extract indicators from.
+
+    Returns:
+        list: A list of dictionaries representing extracted indicators.
+              Each dictionary contains the indicator value and its type.
+    """
     content = content.replace("[.]", ".").replace("[@]", "@")  # Refang indicator prior to checking
     indicators = []
     for regex, type in regex_indicators:
@@ -245,18 +255,15 @@ def extract_text_indicators(content: str):
 
 def identify_json_structure(json_data: dict) -> Any:
     """
-    Identify the structure of a JSON data.
+    Identifies the structure of JSON data based on its content.
 
     Args:
-        json_data (dict): A dictionary representing the JSON data.
+        json_data (dict): The JSON data to identify its structure.
 
     Returns:
-        Any: The identified structure of the JSON data. Possible values are:
-             - "Bundle": If the JSON data is structured as a STIX Bundle.
-             - "Envelope": If the JSON data is structured as a STIX Envelope.
-             - dict: If the JSON data contains a list of STIX objects, returns a dictionary with the key "objects"
-                     and the list of objects as its value.
-             - None: If the structure cannot be identified.
+        Union[str, Dict[str, Any], None]: The identified structure of the JSON data.
+            Possible values are: "Bundle", "Envelope", or a dictionary with the key "objects".
+            Returns None if the structure cannot be identified.
     """
     if isinstance(json_data, dict) and json_data.get("bundle"):
         return "Bundle"
@@ -269,15 +276,13 @@ def identify_json_structure(json_data: dict) -> Any:
 
 def filtering_stix_files(content_files: list) -> list:
     """
-    Filter a list of JSON files to include only STIX files.
+    Filters a list of content files to include only those in STIX format.
 
     Args:
-        content_files (list): A list of JSON files.
+        content_files (list): A list of JSON files or dictionaries representing STIX content.
 
     Returns:
-        list: A filtered list containing only STIX files or objects. If an object is identified as a STIX Envelope or Bundle,
-              it is included as-is. If an object contains a list of STIX objects, it is included with the key "objects" in
-              a dictionary.
+        list: A list of STIX files or dictionaries found in the input list.
     """
     stix_files = []
     for file in content_files:
@@ -329,34 +334,35 @@ def test_module(client: Client) -> str:
         Outputs.
     """
     client._http_request("GET", full_url=client._base_url)
-
     return "ok"
 
 
 def fetch_indicators(
-    client: Client, last_fetch, feed_type: str = "AUTO", tlp_color: Optional[str] = None, feed_tags: List = [], limit: int = -1
+    client: Client,
+    last_commit_fetch,
+    tlp_color: Optional[str] = None,
+    feed_tags: List = [],
+    limit: int = -1,
 ) -> List[Dict]:
     """
-    Fetch indicators from the feed.
+    Fetches indicators from a GitHub repository using the provided client.
 
     Args:
-        client (Client): The HTTP client instance.
-        last_fetch (str): The timestamp indicating when the fetch was last executed.
-        feed_type (str): The type of feed to fetch. Default is "AUTO".
-        tlp_color (str): The Traffic Light Protocol (TLP) color to assign to the fetched indicators.
-        feed_tags (List): List of tags to assign to the fetched indicators.
-        limit (int): Limit the number of fetched indicators. Default is -1, indicating no limit.
+        client (Client): The GitHub client used to fetch indicators.
+        last_commit_fetch: The last commit fetched from the repository.
+        tlp_color (Optional[str]): The Traffic Light Protocol (TLP) color to assign to the fetched indicators.
+        feed_tags (List): Tags to associate with the fetched indicators.
+        limit (int): The maximum number of indicators to fetch. Default is -1 (fetch all).
 
     Returns:
         List[Dict]: A list of dictionaries representing the fetched indicators.
     """
-    demisto.debug(f"Before fetch command last run: {last_fetch}")
-    iterator, last_commit_info = get_indicators(client, feed_type, last_fetch)
+    demisto.debug(f"Before fetch command last commit sha run: {last_commit_fetch}")
+    iterator, last_commit_info = get_indicators(client, last_commit_fetch)
     indicators = []
     if limit > 0:
         iterator = iterator[:limit]
 
-    # extract values from iterator
     for item in iterator:
         value_ = item.get("value")
         type_ = item.get("type")
@@ -365,17 +371,12 @@ def fetch_indicators(
             "type": type_,
         }
 
-        # Create indicator object for each value.
-        # The object consists of a dictionary with required and optional keys and values, as described blow.
         for key, value in item.items():
             raw_data.update({key: value})
         indicator_obj = {
             "value": value_,
             "type": type_,
             "service": "github",
-            # A dictionary that maps values to existing indicator fields defined in Cortex XSOAR.
-            # One can use this section in order to map custom indicator fields previously defined
-            # in Cortex XSOAR to their values.
             "fields": {},
             "rawJSON": raw_data,
         }
@@ -394,28 +395,26 @@ def fetch_indicators(
     return indicators
 
 
-def get_indicators(client: Client, feed_type, last_fetch=None):
+def get_indicators(client: Client, last_commit_fetch=None):
     indicators = []
 
-    relevant_files, last_commit_info = get_commits_files(client, last_fetch)
-    feed_type = detect_type(relevant_files, client) if feed_type == "AUTO" else FEED_TYPE.get(feed_type)
-    format_file = feed_type if feed_type == "yar" else "json" if feed_type == "stix" else None
-    files_tokens = get_files_token(client, relevant_files, format_file)  # type: ignore
+    relevant_files, last_commit_info = get_commits_files(client, last_commit_fetch)
+    feed_type = str(demisto.params().get("feedType"))
+    files_tokens = get_files_token(client, relevant_files)
     try:
-        if feed_type == "yar":
+        if feed_type == "YARA":
             indicators = get_yara_indicator(files_tokens)
             demisto.debug(f"YARA indicators : {indicators}")
 
-        elif feed_type == "stix":
+        elif feed_type == "STIX":
             stix_client = STIX2XSOARParser({})
-            files_tokens = eval((demisto.params()).get("data"))
+            # files_tokens = eval((demisto.params()).get("data"))
             generator_stix_files = create_generator(files_tokens)
             indicators = stix_client.load_stix_objects_from_envelope(generator_stix_files)
 
-        elif feed_type == "iocs":
+        elif feed_type == "IOCs":
             for file in files_tokens:
                 indicators += extract_text_indicators(file)
-            # indicators += extract_text_indicators(str((demisto.params()).get('data')))
             demisto.debug(f"IOCs` indicators : {indicators}")
 
     except Exception as err:
@@ -424,7 +423,7 @@ def get_indicators(client: Client, feed_type, last_fetch=None):
     return indicators, last_commit_info
 
 
-def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandResults:
+def get_indicators_command(client: Client) -> CommandResults:
     """Wrapper for retrieving indicators from the feed to the war-room.
     Args:
         client: Client object with request
@@ -435,7 +434,7 @@ def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandRe
     """
     indicators = []
     try:
-        indicators, _ = get_indicators(client=client, feed_type=feed_type)
+        indicators, _ = get_indicators(client=client)
 
         demisto.debug(f"indicators: {indicators}")
         return CommandResults(
@@ -449,6 +448,7 @@ def get_indicators_command(client: Client, feed_type: str = "AUTO") -> CommandRe
         demisto.debug(str(err))
         raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
 
+
 def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dict]:
     """Wrapper for fetching indicators from the feed to the Indicators tab.
     Args:
@@ -459,9 +459,8 @@ def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dic
     """
     feed_tags = argToList(params.get("feedTags", ""))
     tlp_color = params.get("tlp_color")
-    feed_type = str(params.get("feedType"))
-    last_run = demisto.getLastRun().get("date", None)
-    indicators = fetch_indicators(client, last_run, feed_type=feed_type, tlp_color=tlp_color, feed_tags=feed_tags)
+    last_commit_fetch = demisto.getLastRun().get("last_commit")
+    indicators = fetch_indicators(client, last_commit_fetch, tlp_color=tlp_color, feed_tags=feed_tags)
     return indicators
 
 
@@ -481,7 +480,6 @@ def main():
     repo = str(params.get("repo"))
     api_token = str(params.get("api_token"))
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {api_token}"}
-    feed_type = str(params.get("feedType"))
 
     try:
         client = Client(
@@ -497,7 +495,7 @@ def main():
             return_results(test_module(client))
 
         elif command == "github-get-indicators":
-            return_results(get_indicators_command(client, feed_type))
+            return_results(get_indicators_command(client))
 
         elif command == "fetch-indicators":
             indicators = fetch_indicators_command(client, params)
