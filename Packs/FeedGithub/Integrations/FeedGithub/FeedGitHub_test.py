@@ -3,7 +3,7 @@ from CommonServerPython import string_to_table_header, tableToMarkdown
 
 import json
 
-from Packs.FeedGithub.Integrations.FeedGithub.FeedGitHub import get_yara_indicator, parse_and_map_yara_content, extract_text_indicators
+from Packs.FeedGithub.Integrations.FeedGithub.FeedGitHub import get_yara_indicators, parse_and_map_yara_content, extract_text_indicators
 
 
 URL = "https://openphish.com/feed.txt"
@@ -94,10 +94,13 @@ def doibnttest_build_iterator(requests_mock):
     
     
 def test_extractindicators():
-    text_content = util_load_txt("test_data/iocs.txt")
-    indicator_type = extract_text_indicators(text_content)
+    text_content = {"test_file": util_load_txt("test_data/iocs.txt")}
+    params = {}
+    indicator_type = extract_text_indicators(text_content, params)
+    
+    
 
  
 def test_get_yara_indicators():
-    my_text_content = util_load_txt("test_data/tara_test.yar")
+    my_text_content = {"test_file": util_load_txt("test_data/tara_test.yar")}
     indicators = parse_and_map_yara_content(my_text_content)

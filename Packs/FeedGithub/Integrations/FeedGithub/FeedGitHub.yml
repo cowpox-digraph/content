@@ -12,7 +12,7 @@ configuration:
   display: Server URL
   name: url
   type: 0
-  additionalinfo: The REST API URL
+  additionalinfo: The URL to the github repository
   section: Connect
   required: false
 - defaultvalue: ""
@@ -40,7 +40,7 @@ configuration:
   additionalinfo: Predefined list of indicator types
   section: Connect
   required: true
-- display: Head branch name
+- display: Head branch name/sha
   name: branch_head
   type: 0
   required: true
@@ -50,7 +50,7 @@ configuration:
   name: extensions_to_fetch
   type: 16
   required: true
-  defaultvalue: txt, yar, json
+  defaultvalue: txt,yar,json
   options:
   - txt
   - yar
@@ -62,22 +62,13 @@ configuration:
   hiddenusername: true
   section: Connect
   required: false
-- display: Credentials
-  name: credentials
-  type: 9
+- defaultvalue: ""
+  display: since commit SHA
+  name: commit_sha
+  type: 0
+  additionalinfo: The REST API URL
   section: Connect
   required: false
-- additionalinfo: Indicators from this integration instance will be marked with this reputation
-  defaultvalue: Bad
-  display: Indicator Reputation
-  name: feedReputation
-  options:
-  - None
-  - Good
-  - Suspicious
-  - Bad
-  required: false
-  type: 18
 - additionalinfo: Reliability of the source providing the intelligence data
   defaultvalue: F - Reliability cannot be judged
   display: Source Reliability
@@ -101,11 +92,11 @@ configuration:
   - WHITE
   required: false
   type: 15
-- defaultvalue: '30'
-  display: Feed Fetch Interval
+- display: Feed Fetch Interval
   name: feedFetchInterval
-  required: false
   type: 19
+  defaultvalue: '62'
+  required: false
 - additionalinfo: When selected, the exclusion list is ignored for indicators from this feed. This means that if an indicator from this feed is on the exclusion list, the indicator might still be added to the system.
   defaultvalue: 'true'
   display: Bypass exclusion list
@@ -153,7 +144,7 @@ script:
       name: limit
     description: Gets indicators from the feed.
     name: github-get-indicators
-  dockerimage: devdemisto/taxii2:1.0.0.91860
+  dockerimage: demisto/yarapy:1.0.0.91704
   feed: true
   isfetch: false
   longRunning: false
@@ -163,7 +154,7 @@ script:
   subtype: python3
   type: python
 fromversion: 6.8.0
-description: This is the Feed Hello World integration for getting started with your feed integration.
+description: This is the Feed GitHub integration for getting started with your feed integration.
 marketplaces:
 - xsoar
 - marketplacev2

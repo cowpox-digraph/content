@@ -2,8 +2,10 @@ import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401
 from TAXII2ApiModule import *
 import plyara
+import tldextract
 
 CONTEXT_PREFIX = "GITHUB"
+RAW_RESPONSE = ""
 
 
 class Client(BaseClient):
@@ -17,7 +19,7 @@ class Client(BaseClient):
     """
 
     def __init__(self, base_url: str, verify: bool, proxy: bool, owner: str, repo: str, headers: dict):
-        base_url = urljoin(base_url, f"/repos/{owner}/{repo}/")
+        base_url = urljoin(base_url, f"/repos/{owner}/{repo}")
         super().__init__(base_url=base_url, verify=verify, proxy=proxy, headers=headers)
 
     def get_repo_base_sha(self) -> str:
@@ -31,7 +33,10 @@ class Client(BaseClient):
             str: The SHA of the base commit of the repository.
         """
         all_commits = []
-        response = self._http_request("GET", full_url=f"{self._base_url}commits", resp_type="response")
+        response = self._http_request("GET", full_url=f"{self._base_url}/commits", resp_type="response")
+        demisto.debug(f"The base get_repo_base_sha() raw response: {response}")
+        if "next" not in response.links:
+            all_commits.extend(response.json())
         while "next" in response.links:
             data = response.json()
             all_commits.extend(data)
@@ -49,10 +54,15 @@ class Client(BaseClient):
         Returns:
             list: A list of files modified between the specified base and head commits.
         """
-        return self._http_request("GET", f"compare/{base}...{head}")["files"]
+        try:
+            response = self._http_request("GET", f"/compare/{base}...{head}")["files"]
+        except Exception as e:
+            demisto.error(f"in get_files_between_commits func  error message: {e}")
+        demisto.debug(f"The response from 'get base...head' :{response}")
+        return response
 
 
-def parsing_files_by_status(commits_files: list) -> list:
+def filter_out_files_by_status(commits_files: list) -> list:
     """
     Parses files from a list of commit files based on their status.
 
@@ -64,12 +74,12 @@ def parsing_files_by_status(commits_files: list) -> list:
     """
     relevant_files: list[dict] = []
     for file in commits_files:
-        if file.get("status") == "added" or file.get("status") == "modified":
+        if file.get("status") in ("added", "modified"):
             relevant_files.append(file.get("raw_url"))
     return relevant_files
 
 
-def get_files_token(client: Client, relevant_files: list[str]):
+def get_content_files_from_repo(client: Client, relevant_files: list[str], params:dict):
     """
     Retrieves content of relevant files based on specified extensions.
 
@@ -80,12 +90,21 @@ def get_files_token(client: Client, relevant_files: list[str]):
     Returns:
         list: A list of file contents fetched via HTTP requests.
     """
-    extensions_to_fetch = argToList(demisto.params().get("extensions_to_fetch") or [])
+    global RAW_RESPONSE
+    extensions_to_fetch = argToList(params.get("extensions_to_fetch") or [])
     relevant_files = [file for file in relevant_files if any(file.endswith(ext) for ext in extensions_to_fetch)]
-    return [client._http_request("GET", full_url=file, resp_type="text") for file in relevant_files]
+    raw_data_files = [{file: client._http_request("GET", full_url=file, resp_type="text")} for file in relevant_files]
+    demisto.debug(f"list of all files raw_data :{raw_data_files}")
+    RAW_RESPONSE = [file.values() for file in raw_data_files]
+    return raw_data_files
 
 
-def get_commits_files(client: Client, last_commit_fetch) -> tuple[list, str]:
+def extract_branch_sha(client: Client, branch_name):
+    branch_info = client._http_request("GET", f"/git/refs/heads/{branch_name}")
+    return branch_info["object"]["sha"]
+
+
+def get_commits_files(client: Client, params, last_commit_fetch) -> tuple[list, str]:
     """
     Retrieves relevant files modified between commits and the current repository head.
 
@@ -96,18 +115,18 @@ def get_commits_files(client: Client, last_commit_fetch) -> tuple[list, str]:
     Returns:
         tuple: A tuple containing a list of relevant file URLs and the SHA of the current repository head.
     """
-    current_repo_head = demisto.params().get('branch_head')
+    current_repo_head = params.get("branch_head",'')
     base_repo_sha = last_commit_fetch or client.get_repo_base_sha()
     try:
-        all_commits_files = client.get_files_between_commits(base_repo_sha, current_repo_head) # type: ignore
-        relevant_files = parsing_files_by_status(all_commits_files)
-        return relevant_files, current_repo_head # type: ignore
+        all_commits_files = client.get_files_between_commits(base_repo_sha, current_repo_head)
+        relevant_files = filter_out_files_by_status(all_commits_files)
+        return relevant_files, current_repo_head
 
     except IndexError:
         return [], last_commit_fetch
 
 
-def parse_and_map_yara_content(content_item: str) -> list:
+def parse_and_map_yara_content(content_item: dict[str, str]) -> list:
     """
     Parses YARA rules from a given content item and maps their attributes.
 
@@ -118,35 +137,54 @@ def parse_and_map_yara_content(content_item: str) -> list:
         list: A list of dictionaries representing parsed and mapped YARA rules.
               Each dictionary contains attributes such as rule name, description, author, etc.
     """
-    pattern = re.compile(r"rule\s+\w+\s*?\{(?:.*?\n)*?\}", re.DOTALL)
-    content_rules = pattern.findall(content_item)
+    pattern = re.compile(r"rule\s+\w+\s*?\{(?:.*?)\}(?:$|\n)", re.DOTALL)
+    text_content = list(content_item.values())[0]
+    file_path = list(content_item.keys())[0]
+    content_rules = pattern.findall(text_content)
     parsed_rules = []
     for rule in content_rules:
         parser = plyara.Plyara()
         try:
             parsed_rule = parser.parse_string(rule)[0]
             metadata = {key: value for d in parsed_rule["metadata"] for key, value in d.items()}
+            value_ = parsed_rule["rule_name"]
+            type_ = "YARA"
             mapper = {
-                "value": parsed_rule["rule_name"],
+                "value": value_,
                 "description": metadata.get("description", ""),
                 "author": metadata.get("author", ""),
                 "rulereference": metadata.get("reference", ""),
                 "sourcetimestamp": metadata.get("date", ""),
                 "id": metadata.get("id", ""),
-                "rule strings": parsed_rule.get("strings", []),
+                "rulestrings": make_grid_layout(parsed_rule.get("strings", {})),
                 "condition": " ".join(parsed_rule["condition_terms"]),
-                "type": "YARA",
+                "references": file_path,
                 "raw rule": rule,
             }
-            
-            parsed_rules.append(mapper)
+            indicator_obj = {
+                "value": value_,
+                "type": type_,
+                "service": "github",
+                "fields": mapper,
+                "score": Common.DBotScore.NONE,
+                "rawJSON": {"value": value_, "type": type_},
+            }
+            parsed_rules.append(indicator_obj)
         except Exception as e:
-            demisto.log(f"Rull: {rule} cannot be processed. Error Message: {e}")
+            demisto.error(f"Rull: {rule} cannot be processed. Error Message: {e}")
             continue
     return parsed_rules
 
 
-def get_yara_indicator(content: list):
+def make_grid_layout(list_dict):
+    res = []
+    for d in list_dict:
+        grid_layout = {"name": d.get("name"), "value": d.get("value"), "type": d.get("type"), "modifiers": d.get("modifiers", "")}
+        res.append(grid_layout)
+    return res
+
+
+def get_yara_indicators(content: list[dict]):
     """
     Retrieves YARA indicators from a list of content items.
 
@@ -159,7 +197,6 @@ def get_yara_indicator(content: list):
     res = []
     for item in content:
         res += parse_and_map_yara_content(item)
-    
     return res
 
 
@@ -174,18 +211,7 @@ def detect_domain_type(domain: str):
         Optional[FeedIndicatorType]: The type of the indicator, or None if detection fails.
     """
     try:
-        import tldextract
-    except Exception:
-        raise Exception(
-            "Missing tldextract module, In order to use the auto detect function please use a docker"
-            " image with it installed such as: demisto/jmespath"
-        )
-    try:
-        tldextract_version = tldextract.__version__
-        if LooseVersion(tldextract_version) < "3.0.0":
-            no_cache_extract = tldextract.TLDExtract(cache_file=False, suffix_list_urls=None)
-        else:
-            no_cache_extract = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=None)
+        no_cache_extract = tldextract.TLDExtract(cache_dir=False, suffix_list_urls=None)
 
         if no_cache_extract(domain).suffix:
             if "*" in domain:
@@ -223,7 +249,7 @@ regex_with_groups = [
 ]
 
 
-def extract_text_indicators(content: str):
+def extract_text_indicators(content: dict[str, str], params):
     """
     Extracts indicators from text content using predefined regular expressions.
 
@@ -234,14 +260,16 @@ def extract_text_indicators(content: str):
         list: A list of dictionaries representing extracted indicators.
               Each dictionary contains the indicator value and its type.
     """
-    content = content.replace("[.]", ".").replace("[@]", "@")  # Refang indicator prior to checking
+    text_content = list(content.values())[0]
+    file_path = list(content.keys())[0]
+    text_content = text_content.replace("[.]", ".").replace("[@]", "@")  # Refang indicator prior to checking
     indicators = []
     for regex, type in regex_indicators:
-        matches = re.finditer(regex, content)
+        matches = re.finditer(regex, text_content)
         if matches:
             indicators += [{"value": match.group(0), "type": type} for match in matches]
     for regex, type, group_name in regex_with_groups:
-        matches = re.finditer(regex, content)
+        matches = re.finditer(regex, text_content)
         if matches:
             for match in matches:
                 if regex in (ipv4Regex, urlRegex):
@@ -250,7 +278,28 @@ def extract_text_indicators(content: str):
                     regex_type = type(match.group(group_name))
                     if regex_type:
                         indicators.append({"value": match.group(group_name), "type": regex_type})
-    return indicators
+    indicators_to_xsoar = arrange_iocs_indicator_to_xsoar(file_path, indicators, params)
+    return indicators_to_xsoar
+
+
+def arrange_iocs_indicator_to_xsoar(file_path: str, parsed_indicators: list, params:dict):
+    res = []
+    owner = params.get("owner",'')
+    repo = params.get("repo",'')
+    now = datetime.now().isoformat()
+    for indicator in parsed_indicators:
+        value_ = indicator.get("value")
+        type_ = indicator.get("type")
+        raw_data = {"value": value_, "type": type_}
+        indicator_obj = {
+            "value": value_,
+            "type": type_,
+            "service": "github",
+            "fields": {"references": file_path, "tags": [owner, repo], "firstseenbysource": now},
+            "rawJSON": raw_data,
+        }
+        res.append(indicator_obj)
+    return res
 
 
 def identify_json_structure(json_data: dict) -> Any:
@@ -294,7 +343,7 @@ def filtering_stix_files(content_files: list) -> list:
     return stix_files
 
 
-def create_generator(content_files):
+def create_stix_generator(content_files):
     """
     Create a generator for iterating over STIX files.
 
@@ -314,18 +363,6 @@ def get_stix_files_generator(json_files):
     yield from json_files
 
 
-def detect_type(relevant_files: list, client: Client) -> str:
-    format_file = relevant_files[0].split(".")[-1]
-    if format_file not in ("yar", "json"):
-        return "iocs"
-    if format_file == "json":
-        raw_json = get_files_token(client, relevant_files[0])
-        if not filtering_stix_files(raw_json):
-            return "iocs"
-        return "stix"
-    return format_file
-
-
 def test_module(client: Client) -> str:
     """Builds the iterator to check that the feed is accessible.
     Args:
@@ -340,6 +377,7 @@ def test_module(client: Client) -> str:
 def fetch_indicators(
     client: Client,
     last_commit_fetch,
+    params,
     tlp_color: Optional[str] = None,
     feed_tags: List = [],
     limit: int = -1,
@@ -358,89 +396,88 @@ def fetch_indicators(
         List[Dict]: A list of dictionaries representing the fetched indicators.
     """
     demisto.debug(f"Before fetch command last commit sha run: {last_commit_fetch}")
-    iterator, last_commit_info = get_indicators(client, last_commit_fetch)
+    iterator, last_commit_info = get_indicators(client, params, last_commit_fetch)
     indicators = []
     if limit > 0:
         iterator = iterator[:limit]
 
     for item in iterator:
-        value_ = item.get("value")
-        type_ = item.get("type")
-        raw_data = {
-            "value": value_,
-            "type": type_,
-        }
+        # value_ = item.get("value")
+        # type_ = item.get("type")
+        # raw_data = {
+        #     "value": value_,
+        #     "type": type_,
+        # }
 
-        for key, value in item.items():
-            raw_data.update({key: value})
-        indicator_obj = {
-            "value": value_,
-            "type": type_,
-            "service": "github",
-            "fields": {},
-            "rawJSON": raw_data,
-        }
+        # for key, value in item.items():
+        #     raw_data.update({key: value})
+        # indicator_obj = {
+        #     "value": value_,
+        #     "type": type_,
+        #     "service": "github",
+        #     "fields": {},
+        #     "rawJSON": raw_data,
+        # }
 
         if feed_tags:
-            indicator_obj["fields"]["tags"] = feed_tags
+            item["fields"]["tags"] = feed_tags
 
         if tlp_color:
-            indicator_obj["fields"]["trafficlightprotocol"] = tlp_color
+            item["fields"]["trafficlightprotocol"] = tlp_color
 
-        indicators.append(indicator_obj)
+        indicators.append(item)
     demisto.debug(f"After fetch command last run: {last_commit_info}")
     if last_commit_info:
-        demisto.setLastRun(last_commit_info)
+        demisto.setLastRun({"last_commit": last_commit_info})
 
     return indicators
 
 
-def get_indicators(client: Client, last_commit_fetch=None):
+def get_indicators(client: Client, params, last_commit_fetch=None):
     indicators = []
 
-    relevant_files, last_commit_info = get_commits_files(client, last_commit_fetch)
-    feed_type = str(demisto.params().get("feedType"))
-    files_tokens = get_files_token(client, relevant_files)
+    relevant_files, last_commit_info = get_commits_files(client, params, last_commit_fetch)
+    feed_type = params.get("feedType",'')
+    repo_files_content = get_content_files_from_repo(client, relevant_files, params)
     try:
         if feed_type == "YARA":
-            indicators = get_yara_indicator(files_tokens)
+            indicators = get_yara_indicators(repo_files_content)
             demisto.debug(f"YARA indicators : {indicators}")
 
         elif feed_type == "STIX":
             stix_client = STIX2XSOARParser({})
-            # files_tokens = eval((demisto.params()).get("data"))
-            generator_stix_files = create_generator(files_tokens)
+            generator_stix_files = create_stix_generator(repo_files_content)
             indicators = stix_client.load_stix_objects_from_envelope(generator_stix_files)
 
         elif feed_type == "IOCs":
-            for file in files_tokens:
-                indicators += extract_text_indicators(file)
+            for file in repo_files_content:
+                indicators += extract_text_indicators(file, params)
             demisto.debug(f"IOCs` indicators : {indicators}")
 
     except Exception as err:
         demisto.debug(str(err))
         raise ValueError(f"Could not parse returned data as indicator. \n\nError massage: {err}")
+    demisto.debug(f"fetching {len(indicators)} indicators")
     return indicators, last_commit_info
 
 
-def get_indicators_command(client: Client) -> CommandResults:
+def get_indicators_command(client: Client, params:dict) -> CommandResults:
     """Wrapper for retrieving indicators from the feed to the war-room.
     Args:
         client: Client object with request
         params: demisto.params()
-        args: demisto.args()
     Returns:
         Outputs.
     """
     indicators = []
     try:
-        indicators, _ = get_indicators(client=client)
+        indicators, _ = get_indicators(client, params)
 
         demisto.debug(f"indicators: {indicators}")
         return CommandResults(
             outputs_prefix=CONTEXT_PREFIX + ".Indicators",
             outputs_key_field="githubfeed",
-            raw_response=indicators,
+            raw_response=RAW_RESPONSE,
             outputs=indicators,
         )
 
@@ -460,25 +497,21 @@ def fetch_indicators_command(client: Client, params: Dict[str, str]) -> List[Dic
     feed_tags = argToList(params.get("feedTags", ""))
     tlp_color = params.get("tlp_color")
     last_commit_fetch = demisto.getLastRun().get("last_commit")
-    indicators = fetch_indicators(client, last_commit_fetch, tlp_color=tlp_color, feed_tags=feed_tags)
+    indicators = fetch_indicators(client, last_commit_fetch, params, tlp_color=tlp_color, feed_tags=feed_tags)
     return indicators
 
 
 def main():
-    """
-    main function, parses params and runs command functions
-    """
     params = demisto.params()
-
     command = demisto.command()
 
     demisto.debug(f"Command being called is {command}")
     base_url = str(params.get("url"))
     verify_certificate = not params.get("insecure", False)
     proxy = params.get("proxy", False)
-    owner = str(params.get("owner"))
-    repo = str(params.get("repo"))
-    api_token = str(params.get("api_token"))
+    owner = params.get("owner",'')
+    repo = params.get("repo",'')
+    api_token = (params.get("api_token") or {}).get("password", "")
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {api_token}"}
 
     try:
@@ -495,7 +528,7 @@ def main():
             return_results(test_module(client))
 
         elif command == "github-get-indicators":
-            return_results(get_indicators_command(client))
+            return_results(get_indicators_command(client, params))
 
         elif command == "fetch-indicators":
             indicators = fetch_indicators_command(client, params)
